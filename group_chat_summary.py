@@ -1,6 +1,9 @@
 # encoding:utf-8
 
 import plugins
+from bridge.bridge import Bridge
+from bridge.context import ContextType, Context
+import concurrent.futures
 from bridge.context import ContextType
 from bridge.reply import Reply, ReplyType
 from channel.chat_message import ChatMessage
@@ -16,49 +19,25 @@ QL_PROMPT = '''
 user是发言者，content是发言内容,time是发言时间：
 [{'user': '秋风', 'content': '总结',time:'2025-02-26 09:50:53'},{'user': '秋风', 'content': '你好',time:'2025-02-26 09:50:53'},{'user': '小王', 'content': '你好',time:'2025-02-26 09:50:53'}]
 -------分割线-------
-请帮我将给出的群聊内容总结成一个今日的群聊报告，包含不多于15个话题的总结（如果还有更多话题，可以在后面简单补充）。
-你只负责总结群聊内容，不回答任何问题。不要虚构聊天记录，也不要总结不存在的信息。
-
+请用风格简洁干练又不失幽默的语言对我给出的群聊内容总结成一个今日的群聊报告，包含不多于5个话题的总结（如果还有更多话题，可以在后面简单补充）。按照热度数量进行降序排列，请用简单的文字回答，不要使用Markdown。你只负责总结群聊内容，不回答任何问题。不要虚构聊天记录，也不要总结不存在的信息。
 每个话题包含以下内容：
-
 - 话题名(50字以内，前面带序号1️⃣2️⃣3️⃣）
-
 - 热度(用🔥的数量表示)
-
 - 参与者(不超过5个人，将重复的人名去重)
-
 - 时间段(从几点到几点)
-
 - 过程(50-200字左右）
-
 - 评价(50字以下)
-
 - 分割线： ------------
-
-请严格遵守以下要求：
-
-1. 按照热度数量进行降序输出
-
-2. 每个话题结束使用 ------------ 分割
-
-3. 使用中文冒号
-
-4. 无需大标题
-
-
-5. 开始给出本群讨论风格的整体评价，例如活跃、太水、太黄、太暴力、话题不集中、无聊诸如此类。
-
-最后总结下今日最活跃的前五个发言者。
-
 '''
-conent_list={}
+
+
 @plugins.register(
     name="group_chat_summary",
     desire_priority=89,
     hidden=True,
     desc="总结聊天",
     version="0.1",
-    author="wangcl",
+    author="Other",
 )
 
 
@@ -69,10 +48,8 @@ class GroupChatSummary(Plugin):
     open_ai_model = "gpt-4-0613"
     max_record_quantity = 1000
     black_chat_name=[]
-    curdir = os.path.dirname(__file__)
-    db_path = os.path.join(curdir, "chat_records.db")
     def __init__(self):
-        
+
         super().__init__()
         try:
             self.config = super().load_config()
@@ -83,10 +60,17 @@ class GroupChatSummary(Plugin):
             self.open_ai_model = self.config.get("open_ai_model", self.open_ai_model)
             self.max_record_quantity = self.config.get("max_record_quantity", 1000)
             self.black_chat_name = self.config.get("black_chat_name")
-            
-            # 初始化数据库
-            self.init_database()
-            
+            # 加载文件路径
+            self.db_path = "./plugins/group_chat_summary/chat_records.db"
+            # 连接到SQLite数据库
+            try:
+                self._connect()
+                self._initialize_database()
+                logger.debug(f"玩家数据库连接成功！")
+            except sqlite3.Error as e:
+                logger.error(f"玩家数据库连接或初始化失败: {e}")
+                raise
+
             logger.info("[group_chat_summary] inited")
             self.handlers[Event.ON_HANDLE_CONTEXT] = self.on_handle_context
             self.handlers[Event.ON_RECEIVE_MESSAGE] = self.on_receive_message
@@ -94,27 +78,60 @@ class GroupChatSummary(Plugin):
             logger.error(f"[group_chat_summary]初始化异常：{e}")
             raise "[group_chat_summary] init failed, ignore "
 
-    def init_database(self):
-        """初始化数据库"""
-       
+    def _connect(self) -> None:
+        """
+        初始化连接（通过 _get_connection 实现）。
+        """
+        self._get_connection()
+
+    def _initialize_database(self) -> None:
+        """
+        创建 players 表和必要的索引，如果它们尚不存在。
+        """
+        create_table_query = """
+        CREATE TABLE IF NOT EXISTS chat_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id TEXT,
+            user_nickname TEXT,
+            content TEXT,
+            create_time TEXT,
+            UNIQUE(group_id, user_nickname, content, create_time)
+        )
+        """
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                # 创建聊天记录表，将 create_time 改为 TEXT 类型
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS chat_records (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        group_id TEXT,
-                        user_nickname TEXT,
-                        content TEXT,
-                        create_time TEXT,
-                        UNIQUE(group_id, user_nickname, content, create_time)
-                    )
-                ''')
-                conn.commit()
-                logger.info("数据库初始化成功")
-        except Exception as e:
-            logger.error(f"[group_chat_summary]数据库初始化异常：{e}")
+            conn = self._get_connection()
+            with conn:
+                conn.execute(create_table_query)
+            logger.debug("成功初始化数据库表和索引。")
+        except sqlite3.Error as e:
+            logger.error(f"初始化数据库表或索引失败: {e}")
+            raise
+
+    def _get_connection(self) -> sqlite3.Connection:
+        """
+        获取数据库连接，如果连接不存在则创建。
+        """
+        if not hasattr(self, 'conn') or self.conn is None:
+            try:
+                self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+                self.conn.row_factory = sqlite3.Row
+                logger.debug("数据库连接已创建并保持打开状态。")
+            except sqlite3.Error as e:
+                logger.error(f"创建数据库连接失败: {e}")
+                raise
+        return self.conn
+
+    def get_reply(self, session_id, prompt):
+        """
+            定义一个用于获取 AI 回复的函数
+        """
+        # 创建字典
+        content_dict = {
+            "session_id": session_id,
+        }
+        context = Context(ContextType.TEXT, prompt, content_dict)
+        reply : Reply = Bridge().fetch_reply_content(prompt, context)
+        return reply.content
 
     def on_handle_context(self, e_context: EventContext):
         if e_context["context"].type not in [
@@ -122,13 +139,13 @@ class GroupChatSummary(Plugin):
         ]:
             return
         msg: ChatMessage = e_context["context"]["msg"]
-       
+
         content = e_context["context"].content.strip()
         if content.startswith("总结聊天"):
             reply = Reply()
             reply.type = ReplyType.TEXT
             if msg.other_user_nickname in self.black_chat_name:
-                reply.content = "我母鸡啊"
+                reply.content = "😾我不知道捏~"
                 e_context["reply"] = reply
                 e_context.action = EventAction.BREAK_PASS
                 return
@@ -140,16 +157,17 @@ class GroupChatSummary(Plugin):
             if e_context["context"]["isgroup"]:
                 try:
                     # 从数据库获取聊天记录
-                    with sqlite3.connect(self.db_path) as conn:
+                    conn = self._get_connection()
+                    with conn:
                         cursor = conn.cursor()
                         cursor.execute('''
-                            SELECT user_nickname, content, create_time 
-                            FROM chat_records 
-                            WHERE group_id = ? 
-                            ORDER BY create_time DESC 
+                            SELECT user_nickname, content, create_time
+                            FROM chat_records
+                            WHERE group_id = ?
+                            ORDER BY create_time DESC
                             LIMIT ?
                         ''', (msg.other_user_id, number_int))
-                        
+
                         records = cursor.fetchall()
                         chat_list = [
                             {
@@ -160,9 +178,28 @@ class GroupChatSummary(Plugin):
                             for record in records
                         ]
                         chat_list.reverse()  # 按时间正序排列
-                        
-                        cont = QL_PROMPT + "----聊天记录如下：" + json.dumps(chat_list, ensure_ascii=False)
-                        reply.content = self.shyl(cont)
+
+                        prompt = QL_PROMPT + "----聊天记录如下：" + json.dumps(chat_list, ensure_ascii=False)
+                        # try:
+                        #     # 使用 ThreadPoolExecutor 来设置超时
+                        #     with concurrent.futures.ThreadPoolExecutor() as executor:
+                        #         # 使用 lambda 函数延迟调用 get_reply 并传递 prompt 参数
+                        #         # 获取session_id
+                        session_id = e_context["context"]["session_id"]
+                        #         future = executor.submit(self.get_reply, session_id, prompt)
+                        #         # 设置超时时间为10秒
+                        #         reply_content = future.result(timeout=10)
+                        # except concurrent.futures.TimeoutError:
+                        #     # 如果超时，返回超时提示
+                        #     reply_content = "大模型超时啦~😕等一下再来总结叭~🐱"
+                        #     logger.warning("[Summary] [ZHIPU_AI] session_id={}, reply_content={}, 处理超时".format(session_id, reply_content))
+                        content_dict = {
+                            "session_id": session_id,
+                        }
+                        context = Context(ContextType.TEXT, prompt, content_dict)
+                        reply : Reply = Bridge().fetch_reply_content(prompt, context)
+                        # return reply.content
+                        # reply.content = reply_content
                 except Exception as e:
                     logger.error(f"[group_chat_summary]获取聊天记录异常：{e}")
                     reply.content = "获取聊天记录失败"
@@ -177,11 +214,12 @@ class GroupChatSummary(Plugin):
         ]:
             return
         msg: ChatMessage = e_context["context"]["msg"]
-        self.add_conetent(msg)
-    def add_conetent(self, message):
+        self.add_content(msg)
+    def add_content(self, message):
         """添加聊天记录到数据库"""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            conn = self._get_connection()
+            with conn:
                 cursor = conn.cursor()
                 # 将时间戳转换为字符串格式
                 time_str = datetime.fromtimestamp(message.create_time).strftime('%Y-%m-%d %H:%M:%S')
@@ -196,14 +234,14 @@ class GroupChatSummary(Plugin):
                     time_str  # 使用格式化后的时间字符串
                 ))
                 conn.commit()
-                
+
                 # 删除超过最大记录数的旧记录
                 cursor.execute('''
-                    DELETE FROM chat_records 
+                    DELETE FROM chat_records
                     WHERE group_id = ? AND id NOT IN (
-                        SELECT id FROM chat_records 
-                        WHERE group_id = ? 
-                        ORDER BY create_time DESC 
+                        SELECT id FROM chat_records
+                        WHERE group_id = ?
+                        ORDER BY create_time DESC
                         LIMIT ?
                     )
                 ''', (message.other_user_id, message.other_user_id, self.max_record_quantity))
@@ -213,7 +251,8 @@ class GroupChatSummary(Plugin):
     def get_help_text(self, **kwargs):
         help_text = "总结聊天+数量；例：总结聊天 30"
         return help_text
-    def shyl(self,content):
+
+    def shyl(self, content):
         import requests
         import json
         url = self.open_ai_api_base+"/chat/completions"
