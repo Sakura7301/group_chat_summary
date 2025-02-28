@@ -3,13 +3,11 @@
 import plugins
 from bridge.bridge import Bridge
 from bridge.context import ContextType, Context
-import concurrent.futures
 from bridge.context import ContextType
 from bridge.reply import Reply, ReplyType
 from channel.chat_message import ChatMessage
 from common.log import logger
 from plugins import *
-from config import conf
 import sqlite3
 from datetime import datetime
 
@@ -121,18 +119,6 @@ class GroupChatSummary(Plugin):
                 raise
         return self.conn
 
-    def get_reply(self, session_id, prompt):
-        """
-            定义一个用于获取 AI 回复的函数
-        """
-        # 创建字典
-        content_dict = {
-            "session_id": session_id,
-        }
-        context = Context(ContextType.TEXT, prompt, content_dict)
-        reply : Reply = Bridge().fetch_reply_content(prompt, context)
-        return reply.content
-
     def on_handle_context(self, e_context: EventContext):
         if e_context["context"].type not in [
             ContextType.TEXT
@@ -180,26 +166,13 @@ class GroupChatSummary(Plugin):
                         chat_list.reverse()  # 按时间正序排列
 
                         prompt = QL_PROMPT + "----聊天记录如下：" + json.dumps(chat_list, ensure_ascii=False)
-                        # try:
-                        #     # 使用 ThreadPoolExecutor 来设置超时
-                        #     with concurrent.futures.ThreadPoolExecutor() as executor:
-                        #         # 使用 lambda 函数延迟调用 get_reply 并传递 prompt 参数
-                        #         # 获取session_id
                         session_id = e_context["context"]["session_id"]
-                        #         future = executor.submit(self.get_reply, session_id, prompt)
-                        #         # 设置超时时间为10秒
-                        #         reply_content = future.result(timeout=10)
-                        # except concurrent.futures.TimeoutError:
-                        #     # 如果超时，返回超时提示
-                        #     reply_content = "大模型超时啦~😕等一下再来总结叭~🐱"
-                        #     logger.warning("[Summary] [ZHIPU_AI] session_id={}, reply_content={}, 处理超时".format(session_id, reply_content))
                         content_dict = {
                             "session_id": session_id,
                         }
+                        # 请求大模型
                         context = Context(ContextType.TEXT, prompt, content_dict)
                         reply : Reply = Bridge().fetch_reply_content(prompt, context)
-                        # return reply.content
-                        # reply.content = reply_content
                 except Exception as e:
                     logger.error(f"[group_chat_summary]获取聊天记录异常：{e}")
                     reply.content = "获取聊天记录失败"
@@ -258,12 +231,12 @@ class GroupChatSummary(Plugin):
         url = self.open_ai_api_base+"/chat/completions"
         payload = json.dumps({
             "model": self.open_ai_model,
-         "messages": [{"role": "user", "content": content}],
-         "stream": False
+            "messages": [{"role": "user", "content": content}],
+            "stream": False
         })
         headers = {
-           'Authorization': 'Bearer '+self.open_ai_api_key,
-           'Content-Type': 'application/json'
+            'Authorization': 'Bearer '+self.open_ai_api_key,
+            'Content-Type': 'application/json'
         }
         try:
             response = requests.request("POST", url, headers=headers, data=payload)
