@@ -119,7 +119,7 @@ class GroupChatSummary(Plugin):
         msg: ChatMessage = e_context["context"]["msg"]
 
         content = e_context["context"].content.strip()
-        if content.startswith("总结聊天"):
+        if content.startswith("总结聊天") or content.startswith("聊天总结") or content.startswith("总结群聊") or content.startswith("群聊总结"):
             reply = Reply()
             reply.type = ReplyType.TEXT
             if msg.other_user_nickname in self.black_chat_name:
